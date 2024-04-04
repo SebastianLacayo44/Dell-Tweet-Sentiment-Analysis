@@ -10,6 +10,12 @@ def print_full(df):
     pd.reset_option('display.max_colwidth')
     pd.reset_option('display.max_rows')
     pd.reset_option('display.max_columns')
+
+def print_wide(df):
+    pd.set_option('display.max_columns',None)
+    print(df)
+    pd.reset_option('display.max_columns')
+
 def date_parts(datetime):
     weekday = datetime.weekday()
     if weekday in [5,6]:
@@ -41,19 +47,23 @@ data = pd.read_csv('sentiment-emotion-labelled_Dell_tweets.csv', header=0, names
 # subtract 8 hours from every tweet to sync it with the date of the stock closing price it would affect
 offset = datetime.timedelta(hours=8)
 data['datetime_adj'] = [datetime.datetime.strptime(dt,'%Y-%m-%d %H:%M:%S+00:00')  - offset for dt in data['datetime']]
-
-### Create 'date' column for grouping purposes
+# Use adjusted datetime to create 'date' column for grouping purposes
 data['date'] = pd.to_datetime(data['datetime_adj']).dt.date
 
-### Saturday / Sunday / Monday combination
-#Create various labels to allow combination of a week's Saturday, Sunday, and Monday
-data[['year','month','week','weekday']] = data.apply(lambda d: date_parts(d['datetime_adj']),axis=1,result_type='expand')
-#create list of weekday dates to later re-label the post-SaSuMo combination data with dates
-weekday_key = data[(data['weekday'] != 5) & (data['weekday']!= 6)][['year','week','weekday','date']].drop_duplicates()
-#after creating list of final dates, renumber saturday and sunday as 0. When grouping on weekday, this will combine data for those three days
+
+### Combines Saturday / Sunday / Monday data into a single 'day'
+# Break datetime into year/month/week/weekday components
+data[['year', 'month', 'week', 'weekday']] = data.apply(lambda d: date_parts(d['datetime_adj']), axis=1,
+                                                        result_type='expand')
+# create list of weekday dates tied to combinations of year/week/weekday to later re-label the combined SatSunMon data with the Monday's date
+weekday_key = data[(data['weekday'] != 5) & (data['weekday'] != 6)][
+    ['year', 'week', 'weekday', 'date']].drop_duplicates()
+# after creating list of final dates, renumber saturday and sunday as 0. When grouping on weekday, this will combine data for those three days
 data['weekday'] = data.apply(lambda d: sat_sun_mon_combine(d['weekday']), axis=1)
 
-### Group data by day (Saturday, Sunday, and Monday data grouped together
+
+
+### Group data by day (Saturday, Sunday, and Monday data grouped together)
 data_day = data[['year','week','weekday','sentiment','sentiment_score']].groupby(['year','week','weekday','sentiment'],as_index=False).agg(
     MeanSentScore = ('sentiment_score', 'mean'),
     SumSentScore = ('sentiment_score', 'sum'),
@@ -67,8 +77,8 @@ data_day['NumTweets'] =data_day.apply(lambda row: row['NumTweets']/3 if row['wee
 daily_data = pd.merge(data_day,weekday_key,how='left',on=['year','week','weekday'])
 
 #re-ordering columns
-dd_new_cols = ['date','year', 'week', 'weekday', 'sentiment', 'MeanSentScore', 'SumSentScore', 'NumTweets']
-daily_data = daily_data[dd_new_cols]
+dd_new_col_order = ['date','year', 'week', 'weekday', 'sentiment', 'MeanSentScore', 'SumSentScore', 'NumTweets']
+daily_data = daily_data[dd_new_col_order]
 #renaming date column to make clear that this is an adjusted date
 daily_data.rename(columns={'date': 'stock_date'},inplace=True)
 
@@ -83,13 +93,54 @@ data_month = data[['year','month','sentiment','sentiment_score']].groupby(['year
     SumSentScore = ('sentiment_score', 'sum'),
     NumTweets = ('sentiment_score', np.size))
 
+### re-order data so that a row represents all data for a single date
+def create_pnn_columns(data,time_period_col):
+    pos_data = data[data['sentiment']=='positive'][[time_period_col,'MeanSentScore','SumSentScore','NumTweets']]
+    pos_data.rename(columns={'MeanSentScore': 'pos.meanSS','SumSentScore': 'pos.sumSS','NumTweets': 'pos.numTweets'},inplace=True)
+    neg_data = data[data['sentiment'] == 'negative'][[time_period_col, 'MeanSentScore', 'SumSentScore', 'NumTweets']]
+    neg_data.rename(columns={'MeanSentScore': 'neg.meanSS', 'SumSentScore': 'neg.sumSS', 'NumTweets': 'neg.numTweets'},
+                    inplace=True)
+    neu_data = data[data['sentiment'] == 'neutral'][[time_period_col, 'MeanSentScore', 'SumSentScore', 'NumTweets']]
+    neu_data.rename(columns={'MeanSentScore': 'neu.meanSS', 'SumSentScore': 'neu.sumSS', 'NumTweets': 'neu.numTweets'},
+                    inplace=True)
+    spread_df = pos_data.merge(neg_data,how='outer',on=time_period_col)
+    spread_df = spread_df.merge(neu_data,how='outer',on=time_period_col)
+    return spread_df
 
-daily_data.to_csv('daily_data.csv',index=False)
-data_week.to_csv('weekly_data.csv', index=False)
-data_month.to_csv('monthly_data.csv',index=False)
+# pass the dataframe and the relevant time period that will be used to join the pos/neg/neu data together
+daily_data = create_pnn_columns(daily_data,'stock_date')
+data_week = create_pnn_columns(data_week,'week')
+data_month = create_pnn_columns(data_month,'month')
+
+
+### notes on sentiment score metrics
+# metrics to experiment with?
+# overall sentiment is iffy. The existence of neutral sentiment kind of invalidates this approach, imo
+# I think a % of total tweets would be a better way to look at this
+# or maybe a 'strongest opinion' metric, where we look at the emotion with the highest sentiment? ex negative tweets had on avg more extreme sentiment that pos tweets
+
+
+### calculate some sentiment comparison metrics
+def sentiment_comparison_metrics(data):
+    # % of tweets for each sentiment category
+    data['percent_pos'] = data['pos.numTweets'] / (data['pos.numTweets']+data['neg.numTweets']+data['neu.numTweets'])
+    data['percent_neg'] = data['neg.numTweets'] / (data['pos.numTweets']+data['neg.numTweets']+data['neu.numTweets'])
+    data['percent_neu'] = data['neu.numTweets'] / (data['pos.numTweets']+data['neg.numTweets']+data['neu.numTweets'])
+    # sentiment category with the highest avg sentiment score
+    data['most_extreme_sentiment'] = data[['pos.meanSS','neg.meanSS','neu.meanSS']].idxmax(axis=1)
+    return data
+
+daily_data = sentiment_comparison_metrics(daily_data)
+data_week = sentiment_comparison_metrics(data_week)
+data_month = sentiment_comparison_metrics(data_month)
+
+# create .csv files with summary statistics
+daily_data.to_csv('daily_data_v2.csv',index=False)
+data_week.to_csv('weekly_data_v2.csv', index=False)
+data_month.to_csv('monthly_data_v2.csv',index=False)
+
+
+
 
 ### To-Do -- experiment with how to incorporate emotions
 
-# get total count of pos / neg / neutral tweets by group
-# get summation of sentiment within each group
-# experiment with ways to total that sentiment together
